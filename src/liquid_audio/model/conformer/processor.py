@@ -64,7 +64,10 @@ class AudioPreprocessor(nn.Module, ABC):
                 f"AudioPreprocessor received an input signal of dtype {input_signal.dtype}, rather than torch.float32. In sweeps across multiple datasets, we have found that the preprocessor is not robust to low precision  mathematics. As such, it runs in float32. Your input will be cast to float32, but this is not necessarily enough to recovery full accuracy. For example, simply casting input_signal from torch.float32 to torch.bfloat16, then back to torch.float32 before running AudioPreprocessor causes drops in absolute WER of up to 0.1%. torch.bfloat16 simply does not have enough mantissa bits to represent enough values in the range [-1.0,+1.0] correctly.",
             )
         processed_signal, processed_length = self.get_features(input_signal.to(torch.float32), length)
-        processed_signal = processed_signal.to(self.dtype_sentinel_tensor.dtype)
+        print(processed_signal)
+        print(processed_signal.dtype)
+        
+        # processed_signal = processed_signal.to(torch.float32)
         return processed_signal, processed_length
 
     @abstractmethod
@@ -250,20 +253,20 @@ class FilterbankFeatures(nn.Module):
     def __init__(
         self,
         sample_rate=16000,
-        n_window_size=320,
-        n_window_stride=160,
+        n_window_size=320, #! win_length 
+        n_window_stride=160, #! hop_length
         window="hann",
         normalize="per_feature",
-        n_fft=None,
+        n_fft=None, #! nfft = 512
         preemph=0.97,
-        nfilt=64,
+        nfilt=64, #! feature_size
         lowfreq=0,
         highfreq=None,
         log=True,
         log_zero_guard_type="add",
         log_zero_guard_value=2**-24,
         dither=CONSTANT,
-        pad_to=16,
+        pad_to=16,  #! set to 0
         max_duration=16.7,
         frame_splicing=1,
         exact_pad=False,
@@ -308,7 +311,7 @@ class FilterbankFeatures(nn.Module):
         self.win_length = n_window_size
         self.hop_length = n_window_stride
         self.n_fft = n_fft or 2 ** math.ceil(math.log2(self.win_length))
-        self.stft_pad_amount = (self.n_fft - self.hop_length) // 2 if exact_pad else None
+        self.stft_pad_amount = (self.n_fft - self.hop_length) // 2 if exact_pad else None #! set to None
         self.exact_pad = exact_pad
         self.sample_rate = sample_rate
 
@@ -385,10 +388,10 @@ class FilterbankFeatures(nn.Module):
     def stft(self, x):
         return torch.stft(
             x,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            center=False if self.exact_pad else True,
+            n_fft=self.n_fft, #! 512
+            hop_length=self.hop_length, #! 160
+            win_length=self.win_length, #! 320
+            center=False if self.exact_pad else True, #! since exact_pad is False, center is True
             window=self.window.to(dtype=torch.float, device=x.device),
             return_complex=True,
             pad_mode="constant",
@@ -411,9 +414,9 @@ class FilterbankFeatures(nn.Module):
 
     def get_seq_len(self, seq_len):
         # Assuming that center is True is stft_pad_amount = 0
-        pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2
+        pad_amount = self.stft_pad_amount * 2 if self.stft_pad_amount is not None else self.n_fft // 2 * 2  #! 512
         seq_len = torch.floor_divide((seq_len + pad_amount - self.n_fft), self.hop_length)
-        return seq_len.to(dtype=torch.long)
+        return seq_len.to(dtype=torch.long)  #! seq_len = len // hop_length, this could be an array of seq_len for different audio samples in the batch
 
     @property
     def filter_banks(self):
@@ -423,21 +426,21 @@ class FilterbankFeatures(nn.Module):
         seq_len_time = seq_len
         seq_len_unfixed = self.get_seq_len(seq_len)
         # fix for seq_len = 0 for streaming; if size was 0, it is always padded to 1, and normalizer fails
-        seq_len = torch.where(seq_len == 0, torch.zeros_like(seq_len_unfixed), seq_len_unfixed)
+        seq_len = torch.where(seq_len == 0, torch.zeros_like(seq_len_unfixed), seq_len_unfixed)  #! since seq_len is not 0, seq_len is set to seq_len_unfixed which is len // hop_length, if an audio sample is empty, then its seq_len is set to 0
 
-        if self.stft_pad_amount is not None:
+        if self.stft_pad_amount is not None: #! is none
             x = torch.nn.functional.pad(
                 x.unsqueeze(1), (self.stft_pad_amount, self.stft_pad_amount), "constant"
             ).squeeze(1)
 
         # dither (only in training mode for eval determinism)
-        if self.training and self.dither > 0:
+        if self.training and self.dither > 0:   #! not training
             x += self.dither * torch.randn_like(x)
 
         # do preemphasis
         if self.preemph is not None:
-            timemask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < seq_len_time.unsqueeze(1)
-            x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)
+            timemask = torch.arange(x.shape[1], device=x.device).unsqueeze(0) < seq_len_time.unsqueeze(1)  #! [[True, True, True, ... (len(x) times)] ]
+            x = torch.cat((x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1)  #? first value + diff between consecutive values with preemphasis factor
             x = x.masked_fill(~timemask, 0.0)
 
         # disable autocast to get full range of stft values
@@ -446,18 +449,18 @@ class FilterbankFeatures(nn.Module):
 
         # torch stft returns complex tensor (of shape [B,N,T]); so convert to magnitude
         # guard is needed for sqrt if grads are passed through
-        guard = 0 if not self.use_grads else CONSTANT
+        guard = 0 if not self.use_grads else CONSTANT #! const=1e-5 is used
         x = torch.view_as_real(x)
-        x = torch.sqrt(x.pow(2).sum(-1) + guard)
+        x = torch.sqrt(x.pow(2).sum(-1) + guard) #! sqrt(amplitude**2 + 1e-5) of all the complex values in stft 
 
-        if self.training and self.nb_augmentation_prob > 0.0:
+        if self.training and self.nb_augmentation_prob > 0.0: #! training is false
             for idx in range(x.shape[0]):
                 if self._rng.random() < self.nb_augmentation_prob:
                     x[idx, self._nb_max_fft_bin :, :] = 0.0
 
         # get power spectrum
         if self.mag_power != 1.0:
-            x = x.pow(self.mag_power)
+            x = x.pow(self.mag_power) #! amplitude squared values are kept
 
         # return plain spectrogram if required
         if linear_spec:
@@ -470,15 +473,15 @@ class FilterbankFeatures(nn.Module):
             x = torch.matmul(self.fb.to(x.dtype), x)
         # log features if required
         if self.log:
-            if self.log_zero_guard_type == "add":
-                x = torch.log(x + self.log_zero_guard_value_fn(x))
+            if self.log_zero_guard_type == "add":  #!  True
+                x = torch.log(x + self.log_zero_guard_value_fn(x)) #! log(spectrogram + 2**-24)
             elif self.log_zero_guard_type == "clamp":
                 x = torch.log(torch.clamp(x, min=self.log_zero_guard_value_fn(x)))
             else:
                 raise ValueError("log_zero_guard_type was not understood")
 
         # frame splicing if required
-        if self.frame_splicing > 1:
+        if self.frame_splicing > 1: #! 1
             x = splice_frames(x, self.frame_splicing)
 
         # normalize if required
@@ -488,24 +491,24 @@ class FilterbankFeatures(nn.Module):
         # mask to zero any values beyond seq_len in batch, pad to multiple of `pad_to` (for efficiency)
         max_len = x.size(-1)
         mask = torch.arange(max_len, device=x.device)
-        mask = mask.repeat(x.size(0), 1) >= seq_len.unsqueeze(1)
-        x = x.masked_fill(mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value)
+        mask = mask.repeat(x.size(0), 1) >= seq_len.unsqueeze(1) #! [[False, False, False, ... (seq_len[0] times), True, True, ...], [False, False, ... (seq_len[1] times), True, True, ...], ...], True for the windows that are padded
+        x = x.masked_fill(mask.unsqueeze(1).type(torch.bool).to(device=x.device), self.pad_value) #! set the extra windows that are padded to 0, since the original spectrogram values are all positive, this will not cause confusion between real values and padded values
         del mask
         pad_to = self.pad_to
-        if pad_to == "max":
+        if pad_to == "max": #! False
             x = nn.functional.pad(x, (0, self.max_length - x.size(-1)), value=self.pad_value)
-        elif pad_to > 0:
+        elif pad_to > 0: #! False
             pad_amt = x.size(-1) % pad_to
             if pad_amt != 0:
                 x = nn.functional.pad(x, (0, pad_to - pad_amt), value=self.pad_value)
-        return x, seq_len
+        return x, seq_len #! this is returned directly
 
 def normalize_batch(x, seq_len, normalize_type):
     x_mean = None
     x_std = None
     if normalize_type == "per_feature":
-        batch_size = x.shape[0]
-        max_time = x.shape[2]
+        batch_size = x.shape[0]  #? total number of samples in the batch
+        max_time = x.shape[2]  #? sample length // hop_length + 2 (padding), this is the max seq_len in the batch after padding
 
         # When doing stream capture to a graph, item() is not allowed
         # becuase it calls cudaStreamSynchronize(). Therefore, we are
@@ -521,9 +524,9 @@ def normalize_batch(x, seq_len, normalize_type):
                 "feature (ex. at least `hop_length` for Mel Spectrograms)."
             )
         time_steps = torch.arange(max_time, device=x.device).unsqueeze(0).expand(batch_size, max_time)
-        valid_mask = time_steps < seq_len.unsqueeze(1)
-        x_mean_numerator = torch.where(valid_mask.unsqueeze(1), x, 0.0).sum(axis=2)
-        x_mean_denominator = valid_mask.sum(axis=1)
+        valid_mask = time_steps < seq_len.unsqueeze(1)  #! [[True, True, True, ... (seq_len[0] times), False, False, ...], [True, True, ... (seq_len[1] times), False, False, ...], ...]
+        x_mean_numerator = torch.where(valid_mask.unsqueeze(1), x, 0.0).sum(axis=2)  #! sum of all the valid values (amplitude**2 of each window) in the time dimension for each feature and each sample in the batch, shape is [batch_size, num_features]
+        x_mean_denominator = valid_mask.sum(axis=1)  #! number of valid time steps (windows) for each sample in the batch, shape is [batch_size]
         x_mean = x_mean_numerator / x_mean_denominator.unsqueeze(1)
 
         # Subtract 1 in the denominator to correct for the bias.
@@ -531,9 +534,9 @@ def normalize_batch(x, seq_len, normalize_type):
             torch.sum(torch.where(valid_mask.unsqueeze(1), x - x_mean.unsqueeze(2), 0.0) ** 2, axis=2)
             / (x_mean_denominator.unsqueeze(1) - 1.0)
         )
-        x_std = x_std.masked_fill(x_std.isnan(), 0.0)  # edge case: only 1 frame in denominator
+        x_std = x_std.masked_fill(x_std.isnan(), 0.0)  # edge case: only 1 frame in denominator #! it means if  x_mean_denominator = 1, and denominator becomes 0, then x_std becomes nan, in this case we set x_std to 0.0
         # make sure x_std is not zero
-        x_std += CONSTANT
+        x_std += CONSTANT #! add 1e-5 to all values
         return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2), x_mean, x_std
     elif normalize_type == "all_features":
         x_mean = torch.zeros(seq_len.shape, dtype=x.dtype, device=x.device)

@@ -13,7 +13,7 @@ from liquid_audio.detokenizer import LFM2AudioDetokenizer
 from liquid_audio.model.conformer.processor import AudioToMelSpectrogramPreprocessor
 from liquid_audio.moshi.models.compression import MimiModel
 from liquid_audio.utils import LFMModality, get_model_dir, mel2emb_len
-
+from torchcodec.decoders import AudioDecoder
 
 @dataclass(kw_only=True)
 class PreprocessorConfig:
@@ -30,6 +30,18 @@ class PreprocessorConfig:
     pad_to: int
     pad_value: float
 
+    # "sample_rate": 16000,
+    # "normalize": "per_feature",
+    # "window_size": 0.025,
+    # "window_stride": 0.01,
+    # "window": "hann",
+    # "features": 128,
+    # "n_fft": 512,
+    # "log": true,
+    # "frame_splicing": 1,
+    # "dither": 1.0e-05,
+    # "pad_to": 0,
+    # "pad_value": 0.0
 
 class LFM2AudioProcessor:
     """Container for LFM2-Audio text and audio processors"""
@@ -42,8 +54,8 @@ class LFM2AudioProcessor:
         detokenizer_path: str | None = None,
         name: str | None = None,
     ) -> None:
-        self.text_tokenizer = AutoTokenizer.from_pretrained(text_tokenizer_path)
-        self.audio_processor = AudioToMelSpectrogramPreprocessor(**asdict(audio_processor_config)).eval()
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_tokenizer_path)  #? the text tokenizer is loaded from the same cache repo path and AutoTokenizer correctly figures out the tokenizer
+        self.audio_processor = AudioToMelSpectrogramPreprocessor(**asdict(audio_processor_config)).eval() #todo explore, this is the init point of AudioToMelSpectrogramPreprocessor, and the config is passed as keyword arguments
         self.mimi_weights_path = mimi_weights_path
         self.detokenizer_path = detokenizer_path
 
@@ -55,23 +67,23 @@ class LFM2AudioProcessor:
     @classmethod
     def from_pretrained(
         cls,
-        repo_id: str | Path,
+        repo_id: str | Path, #? start
         *,
         revision: str | None = None,
         device: torch.device | str = "cuda",
     ) -> Self:
-        cache_path = get_model_dir(repo_id, revision=revision)
+        cache_path = get_model_dir(repo_id, revision=revision) #? suppose the cache path is returned as it is already downloaded
         with (cache_path / "config.json").open() as f:
-            config = json.load(f)
+            config = json.load(f) #? item 1
 
         mimi_ckpt = cache_path / "tokenizer-e351c8d8-checkpoint125.safetensors"
-        mimi_weights_path = str(mimi_ckpt) if mimi_ckpt.exists() else None
+        mimi_weights_path = str(mimi_ckpt) if mimi_ckpt.exists() else None #? item 2
 
         detok_ckpt = cache_path / "audio_detokenizer"
-        detokenizer_weights_path = str(detok_ckpt) if detok_ckpt.exists() else None
+        detokenizer_weights_path = str(detok_ckpt) if detok_ckpt.exists() else None #? item 3
 
-        return cls(
-            text_tokenizer_path=str(cache_path),
+        return cls( #? this cls refers to the class, so from_pretrained inits and returns an object of LFM2AudioProcessor
+            text_tokenizer_path=str(cache_path), #! the path to the cache folder of the model is passed
             audio_processor_config=PreprocessorConfig(**config["preprocessor"]),
             mimi_weights_path=mimi_weights_path,
             detokenizer_path=detokenizer_weights_path,
@@ -79,7 +91,9 @@ class LFM2AudioProcessor:
         ).to(device)
 
     def to(self, device: str | torch.device | None = None, dtype: torch.dtype | None = None) -> Self:
+        print(f"moving processor to device {device} and dtype {dtype}")
         self.audio_processor.to(device=device, dtype=dtype)
+        print(f"audio processor is on device {next(self.audio_processor.buffers()).device} and dtype {next(self.audio_processor.buffers()).dtype}")
         return self
 
     def eval(self) -> Self:
@@ -192,12 +206,13 @@ class ChatState(Mapping):
         start = "<|startoftext|>"
 
         self.text = self.proc.text.encode(start, add_special_tokens=False, return_tensors="pt").to(self.device)
+        print(self.text.dtype, "text dtype")
         self.audio_in = torch.empty((128, 0), device=self.device, dtype=self.dtype)
         self.audio_in_lens = torch.empty((0,), device=self.device, dtype=torch.long)
         self.audio_out = self.text.new_empty((self.codebooks, 0))
 
         self.modality_flag = torch.full_like(self.text, LFMModality.TEXT)
-
+        #! to investigate, torch.empty, torch.new_empty, torch.full_like
     def __repr__(self) -> str:
         return f"ChatState(text_tok: {self.text.shape[1]}, audio_in: {self.audio_in.shape[1]}, audio_out: {self.audio_out.shape[1]})"
 
@@ -225,17 +240,18 @@ class ChatState(Mapping):
 
     def add_audio(self, wave: torch.Tensor, sampling_rate: int) -> None:
         assert len(wave.shape) == 2
-        assert wave.shape[0] == 1
+        assert wave.shape[0] == 1 #! single batch
 
         device = next(self.proc.audio.buffers()).device
 
         wave = wave.to(device=device)
-        wave = torchaudio.functional.resample(wave, sampling_rate, 16_000)
-        length = torch.tensor([wave.shape[1]], dtype=torch.long, device=wave.device)
+        wave = torchaudio.functional.resample(wave, sampling_rate, 16_000) #? it is ensured that each second has 16000 data points
+        length = torch.tensor([wave.shape[1]], dtype=torch.long, device=wave.device) #! number of data point for the whole clip of audio
 
-        mel, _ = self.proc.audio(wave, length)
-
-        new_audio_in = mel[0].to(self.dtype)
+        mel, _ = self.proc.audio(wave, length) #? return processed_signal, processed_length
+        print(self.dtype, "processor dtype")
+        new_audio_in = mel[0].to(self.dtype) #! first audio of shape (w, h) where w is the freq values, and h is the time frames, and it is converted to the dtype of the processor
+        print(new_audio_in.dtype)
         new_mod = self.modality_flag.new_tensor(
             [
                 [
