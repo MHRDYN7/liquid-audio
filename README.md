@@ -5,6 +5,8 @@ We present LFM2-Audio-1.5B, [Liquid AI](https://www.liquid.ai/)'s first end-to-e
 LFM2-Audio supports two generation modes, interleaved and sequential, to maximize performance and quality across different tasks. Interleaved generation outputs text and audio tokens in a fixed interleaved pattern. This approach minimizes time to first audio output and number of tokens generated, making it ideal for naturally flowing real-time speech-to-speech interactions on resource constrained devices. Sequential generation mode, where the model decides when to switch modalities via special tokens, is suitable for non-conversational tasks, such as speech-to-text (ASR) or text-to-speech (TTS).
 
 ### Updates
+- The Japanese version of our model [LiquidAI/LFM2.5-Audio-1.5B-JP](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP) is released! It is the first Japanese speech-to-speech model of this scale. To try it out, follow the instructions [here](./README_JP.md).
+- [Finetuning](#finetuning) is now supported in both interleaved and sequential generation modes. Version 1.2.0 introduces data preparation tools and a lightweight trainer, enabling users to fine-tune models for a broad range of tasks, from ASR and TTS to function calling and end-to-end speech-to-speech chat.
 - [LFM2.5-Audio-1.5B](https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B) is released! This model is based on the stronger LFM2.5-1.2B base, and comes with a lightning fast LFM2 based audio detokenizer, stronger ASR, and better TTS voices. To use the new detokenizer, simply use `processor.decode`, see the examples below for more details. For the improved TTS voices, see the [TTS](#tts) section.
 
 ## Installation
@@ -13,6 +15,11 @@ The package can be installed via `pip`
 pip install liquid-audio
 pip install "liquid-audio [demo]" # optional, to install demo dependencies
 pip install flash-attn --no-build-isolation  # optional, to use flash attention 2. Will fallback to torch SDPA if not installed
+```
+
+For installation on AMD ROCm, don't forget to specify the correct `pytorch` version and index, e.g.
+```bash
+pip install liquid-audio torch==2.12.0+rocm7.2 --extra-index-url https://download.pytorch.org/whl/rocm7.2
 ```
 
 ## Usage
@@ -60,7 +67,7 @@ https://github.com/user-attachments/assets/d0d054b2-6d1d-49fb-94df-4aa0b6641990
 
 ```python
 import torch
-import torchaudio
+import soundfile as sf
 from liquid_audio import LFM2AudioModel, LFM2AudioProcessor, ChatState, LFMModality
 
 # Load models
@@ -77,7 +84,8 @@ chat.add_text("Respond with interleaved text and audio.")
 chat.end_turn()
 
 chat.new_turn("user")
-wav, sampling_rate = torchaudio.load("assets/question.wav")
+wav, sampling_rate = sf.read("assets/question.wav", dtype="float32")
+wav = torch.from_numpy(wav).unsqueeze(0)
 chat.add_audio(wav, sampling_rate)
 chat.end_turn()
 
@@ -102,7 +110,7 @@ for t in model.generate_interleaved(**chat, max_new_tokens=512, audio_temperatur
 # Mimi returns audio at 24kHz
 audio_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
 waveform = processor.decode(audio_codes)
-torchaudio.save("answer1.wav", waveform.cpu(), 24_000)
+sf.write("answer1.wav", waveform.cpu()[0], 24_000)
 
 # Append newly generated tokens to chat history
 chat.append(
@@ -132,7 +140,7 @@ for t in model.generate_interleaved(**chat, max_new_tokens=512, audio_temperatur
 # Detokenize second turn audio, removing the last "end-of-audio" codes
 audio_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
 waveform = processor.decode(audio_codes)
-torchaudio.save("answer2.wav", waveform.cpu(), 24_000)
+sf.write("answer2.wav", waveform.cpu()[0], 24_000)
 ```
 
 
@@ -151,7 +159,7 @@ https://github.com/user-attachments/assets/b3cc017f-363d-49f3-8e7d-f6db9556900e
 
 ```python
 import torch
-import torchaudio
+import soundfile as sf
 from liquid_audio import LFM2AudioModel, LFM2AudioProcessor, ChatState, LFMModality
 
 # Load models
@@ -168,7 +176,8 @@ chat.add_text("Perform ASR.")
 chat.end_turn()
 
 chat.new_turn("user")
-wav, sampling_rate = torchaudio.load("assets/asr.wav")
+wav, sampling_rate = sf.read("assets/asr.wav", dtype="float32")
+wav = torch.from_numpy(wav).unsqueeze(0)
 chat.add_audio(wav, sampling_rate)
 chat.end_turn()
 
@@ -207,7 +216,7 @@ https://github.com/user-attachments/assets/8d57c184-b92e-4e1a-983b-d1f9d16d0d92
 
 ```python
 import torch
-import torchaudio
+import soundfile as sf
 from liquid_audio import LFM2AudioModel, LFM2AudioProcessor, ChatState, LFMModality
 
 # Load models
@@ -238,7 +247,50 @@ for t in model.generate_sequential(**chat, max_new_tokens=512, audio_temperature
 # Detokenize audio
 audio_codes = torch.stack(audio_out[:-1], 1).unsqueeze(0)
 waveform = processor.decode(audio_codes)
-torchaudio.save("tts.wav", waveform.cpu(), 24_000)
+sf.write("tts.wav", waveform.cpu()[0], 24_000)
+```
+
+## Finetuning
+
+To finetune on your own data, make use of the `ChatMessage` interface. This requires you to:
+
+1. map your raw dataset rows into `list[ChatMessage]`
+2. use the [`LFM2AudioChatMapper`](src/liquid_audio/data/mapper.py) to create a preprocessed dataset
+3. train a model from the preprocessed dataset with `LFM2DataLoader`
+
+### Preprocess
+
+Before training, convert dataset into our preprocessed training format.
+
+To do that, define an iterator that yields one `list[ChatMessage]` per sample in your dataset.
+The `LFM2AudioChatMapper` handles turning those messages into model-ready features.
+
+`ChatMessage` supports:
+
+* `TextSegment(text=...)`
+* `AudioSegment(audio=...)`
+* `InterleavedSegment(text=..., audio=...)`
+
+See [examples/preprocess_jenny_tts.py](examples/preprocess_jenny_tts.py) for an example of how to preprocess the
+[Jenny TTS Dataset](https://huggingface.co/datasets/reach-vb/jenny_tts_dataset) for TTS model finetuning.
+
+Run preprocessing with:
+
+```bash
+python examples/preprocess_jenny_tts.py
+```
+
+This writes a preprocessed dataset to `data/jenny_tts/train`.
+
+### Train
+
+Training reads a preprocessed dataset.
+
+For example, to finetune a model on the [Jenny TTS Dataset](https://huggingface.co/datasets/reach-vb/jenny_tts_dataset)
+using the preprocessed dataset from before, run:
+
+```bash
+python examples/train.py
 ```
 
 
